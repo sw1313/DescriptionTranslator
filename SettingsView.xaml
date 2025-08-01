@@ -1,0 +1,55 @@
+﻿<UserControl x:Class="DescriptionTranslator.SettingsView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             MinWidth="520">
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="16" VerticalAlignment="Top">
+
+            <!-- 语言 -->
+            <TextBlock Text="Source language (auto/en/ja…)" />
+            <TextBox  Text="{Binding SourceLang}" Margin="0,4,0,12"/>
+
+            <TextBlock Text="Target language (zh/en/ja…)" />
+            <TextBox  Text="{Binding TargetLang}" Margin="0,4,0,12"/>
+
+            <!-- 端点与鉴权 -->
+            <CheckBox Content="Use OpenAI official API"
+                IsChecked="{Binding UseOpenAI}" Margin="0,4,0,12"/>
+
+            <TextBlock Text="API Url" />
+            <TextBox  Text="{Binding ApiUrl}" Margin="0,4,0,12"/>
+
+            <TextBlock Text="API Key" />
+            <!-- 用 PasswordBox；通过事件与配置同步，并在 Loaded 时回显已保存值 -->
+            <PasswordBox x:Name="ApiKeyBox"
+                   Margin="0,4,0,12"
+                   Loaded="ApiKeyBox_Loaded"
+                   PasswordChanged="ApiKeyBox_PasswordChanged" />
+
+            <!-- 模型与提示词 -->
+            <TextBlock Text="Model" />
+            <TextBox  Text="{Binding Model}" Margin="0,4,0,12"/>
+
+            <TextBlock Text="System prompt (supports ${src}/${dst})" />
+            <TextBox  Text="{Binding SystemPrompt}" AcceptsReturn="True" Height="80" Margin="0,4,0,12"/>
+
+            <!-- 采样参数 -->
+            <TextBlock Text="Temperature" />
+            <TextBox  Text="{Binding Temperature}" Margin="0,4,0,12"/>
+
+            <TextBlock Text="Top-p" />
+            <TextBox  Text="{Binding TopP}" Margin="0,4,0,12"/>
+
+            <TextBlock Text="n_predict (llama.cpp)" />
+            <TextBox  Text="{Binding NPredict}" Margin="0,4,0,12"/>
+
+            <TextBlock Text="Repetition penalty" />
+            <TextBox  Text="{Binding RepetitionPenalty}" Margin="0,4,0,12"/>
+
+            <TextBlock Text="Frequency penalty" />
+            <TextBox  Text="{Binding FrequencyPenalty}" Margin="0,4,0,0"/>
+
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>
