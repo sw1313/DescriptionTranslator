@@ -4,6 +4,9 @@ using Playnite.SDK.Plugins;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Controls;
 
 namespace DescriptionTranslator
@@ -21,17 +24,14 @@ namespace DescriptionTranslator
         {
             this.api = api;
 
-            // ① 告诉 Playnite「我有设置页」—— 通过 Properties.HasSettings
-            //    （不要 override；直接在构造函数里赋值）
-            Properties = new GenericPluginProperties
-            {
-                HasSettings = true
-            };
+            // 提升 .NET 的同主机并发连接上限（默认是 2，会“假阻塞”）
+            ServicePointManager.DefaultConnectionLimit = Math.Max(ServicePointManager.DefaultConnectionLimit, 128);
+            ServicePointManager.Expect100Continue = false;
+            ServicePointManager.UseNagleAlgorithm = false;
 
-            // ② 读取（或创建）配置对象
+            Properties = new GenericPluginProperties { HasSettings = true };
+
             cfg = LoadPluginSettings<TranslatorConfig>() ?? new TranslatorConfig();
-
-            // ③ 绑定保存回调：这样在设置页点“保存”时，配置会真正写入 config.json
             cfg.AttachSaver(s => SavePluginSettings(s));
         }
 
@@ -46,7 +46,7 @@ namespace DescriptionTranslator
             };
         }
 
-        // ───── 游戏右键菜单：单个翻译 ─────
+        // ───── 右键菜单：单个翻译 ─────
         public override IEnumerable<GameMenuItem> GetGameMenuItems(GetGameMenuItemsArgs args)
         {
             yield return new GameMenuItem
@@ -57,31 +57,68 @@ namespace DescriptionTranslator
             };
         }
 
+        /// <summary>
+        /// 后台线程 + 可取消全局进度；内部使用**有界并发**翻译多个游戏。
+        /// </summary>
         private void TranslateGames(IEnumerable<Game> games)
         {
-            var translator = new HtmlTranslator(cfg);
-
-            foreach (var g in games)
+            var gameList = games.Where(g => !string.IsNullOrWhiteSpace(g.Description)).ToList();
+            if (gameList.Count == 0)
             {
-                if (string.IsNullOrWhiteSpace(g.Description))
-                    continue;
-
-                try
-                {
-                    g.Description = translator.TranslateHtml(g.Description);
-                    api.Database.Games.Update(g);
-                }
-                catch (Exception ex)
-                {
-                    Log.Error($"[{g.Name}] 翻译失败：{ex}");
-                }
+                api.Dialogs.ShowMessage("所选游戏均无描述，无需翻译。", "DescriptionTranslator");
+                return;
             }
 
-            api.Notifications.Add(new NotificationMessage(
-                Guid.NewGuid().ToString(), "描述翻译已完成", NotificationType.Info));
+            // ActivateGlobalProgress 的回调是同步 Action。
+            // 我们在里面自己做 Task.WhenAll().GetAwaiter().GetResult() 来等待并发完成。
+            api.Dialogs.ActivateGlobalProgress(progress =>
+            {
+                progress.Text = $"正在翻译描述… (0 / {gameList.Count})";
+                progress.IsIndeterminate = false;
+
+                var translator = new HtmlTranslator(cfg);
+                int done = 0;
+
+                // 游戏级有界并发（与 HTTP 并发/服务端 slots 保持近似）
+                int parallelGames = Math.Max(1, cfg.ChunkConcurrency);
+                var gate = new SemaphoreSlim(parallelGames, parallelGames);
+
+                var tasks = gameList.Select(async g =>
+                {
+                    await gate.WaitAsync().ConfigureAwait(false);
+                    try
+                    {
+                        if (progress.CancelToken.IsCancellationRequested) return;
+
+                        string newHtml = await translator.TranslateHtmlAsync(g.Description, progress.CancelToken).ConfigureAwait(false);
+                        g.Description = newHtml;
+                        api.Database.Games.Update(g);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error($"[{g.Name}] 翻译失败：{ex}");
+                    }
+                    finally
+                    {
+                        Interlocked.Increment(ref done);
+                        progress.Text = $"正在翻译描述… ({done} / {gameList.Count})";
+                        gate.Release();
+                    }
+                }).ToArray();
+
+                Task.WhenAll(tasks).GetAwaiter().GetResult();
+
+                api.Notifications.Add(new NotificationMessage(
+                    Guid.NewGuid().ToString(),
+                    "描述翻译任务已结束（成功或已取消）。",
+                    NotificationType.Info));
+
+            }, new GlobalProgressOptions("DescriptionTranslator", true)
+            {
+                IsIndeterminate = false
+            });
         }
 
-        // ───── 设置序列化 & 视图 ─────
         public override ISettings GetSettings(bool _) => cfg;
         public override UserControl GetSettingsView(bool _) => new SettingsView { DataContext = cfg };
     }

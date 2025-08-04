@@ -49,7 +49,9 @@
   <ItemGroup>
     <Compile Include="DescriptionTranslatorPlugin.cs" />
     <Compile Include="TranslatorConfig.cs" />
-    <Compile Include="HtmlTranslator.cs" />
+    <Compile Include="HtmlTranslator.cs">
+      <SubType>Component</SubType>
+    </Compile>
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="SettingsView.xaml.cs">
       <DependentUpon>SettingsView.xaml</DependentUpon>
