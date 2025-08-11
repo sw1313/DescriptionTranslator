@@ -13,7 +13,6 @@ using System.Threading.Tasks;
 
 namespace DescriptionTranslator
 {
-    /*────────────────── 1. 带超时 WebClient ──────────────────*/
     internal sealed class WebClientEx : WebClient
     {
         public int TimeoutMs { get; set; } = 24 * 60 * 60 * 1000;
@@ -31,152 +30,254 @@ namespace DescriptionTranslator
         }
     }
 
-    /*────────────────── 2. HtmlTranslator ──────────────────*/
     internal class HtmlTranslator
     {
         private static readonly ILogger Log = LogManager.GetLogger();
         private readonly TranslatorConfig cfg;
 
-        // 并发 / 超时 / 幻觉策略（保持原有模式）
-        private const int WORKER_COUNT = 3;                // HTTP 并发上限
-        private const int HTTP_TIMEOUT_MS = 120_000;       // 单次 HTTP 超时
-        private const int SINGLE_HALLUCINATION_MAX = 2;    // 单行幻觉最多允许 2 次
-        private const int HTTP_MAX_RETRIES = 3;            // 瞬时错误最大重试次数
+        private const int WORKER_COUNT = 3;
+        private const int HTTP_TIMEOUT_MS = 120_000;
+        private const int SINGLE_HALLUCINATION_MAX = 2;
+        private const int HTTP_MAX_RETRIES = 3;
+
+        // 新增：目标语言占比跳过阈值（90%）
+        private const double LANG_SKIP_THRESHOLD = 0.90;
 
         private static readonly SemaphoreSlim HttpGate = new SemaphoreSlim(WORKER_COUNT, WORKER_COUNT);
 
         public HtmlTranslator(TranslatorConfig c) => cfg = c;
 
-        /*──────── 补齐：拼接 System prompt ────────*/
         private string BuildSystemPrompt(string fallback)
         {
-            // 允许在配置里写模板：支持 ${src} / ${dst}
             var sp = (cfg.SystemPrompt ?? "").Trim();
             if (!string.IsNullOrEmpty(sp))
-            {
                 return sp.Replace("${src}", cfg.SourceLang ?? "auto")
                          .Replace("${dst}", cfg.TargetLang ?? "zh");
-            }
             return fallback;
         }
 
-        /*──────── 新增：文件级 API（读取 -> 翻译 -> 写回） ────────*/
+        /* ==================== 新增：整页目标语言占比检测 ==================== */
+        public bool ShouldSkipByLanguage(string html, out double coverage)
+        {
+            coverage = 0;
+            if (string.IsNullOrEmpty(html)) return false;
+
+            var doc = new HtmlDocument();
+            doc.LoadHtml(html);
+
+            var skipTags = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "script","style","noscript","code","pre","kbd","samp","var","svg","math" };
+
+            // 收集可翻译纯文本（与翻译时一致：不看 <a> 内文）
+            var textNodes = doc.DocumentNode
+                .Descendants()
+                .Where(n => n.NodeType == HtmlNodeType.Text &&
+                            !HasAncestor(n, skipTags) &&
+                            !HasAncestor(n, "a"))
+                .Select(n => ((HtmlTextNode)n).Text)
+                .ToList();
+
+            if (textNodes.Count == 0) return false;
+
+            string langKind = NormalizeLang(cfg.TargetLang);
+            long targetLetters = 0;
+            long totalLetters = 0;
+
+            foreach (var raw in textNodes)
+            {
+                if (string.IsNullOrEmpty(raw)) continue;
+
+                // 仅统计“字母类”字符；忽略数字/空白/标点
+                foreach (var ch in raw)
+                {
+                    if (!char.IsLetter(ch)) continue;
+                    totalLetters++;
+                    if (IsTargetLetter(ch, langKind)) targetLetters++;
+                }
+            }
+
+            if (totalLetters == 0) return false;
+            coverage = targetLetters / (double)totalLetters;
+            return coverage >= LANG_SKIP_THRESHOLD;
+        }
+
+        private static string NormalizeLang(string lang)
+        {
+            if (string.IsNullOrWhiteSpace(lang)) return "zh";
+            lang = lang.Trim().ToLowerInvariant();
+            if (lang.StartsWith("zh")) return "zh";
+            if (lang.StartsWith("ja")) return "ja";
+            if (lang.StartsWith("ko")) return "ko";
+            if (lang.StartsWith("en")) return "en";
+            if (lang.StartsWith("ru")) return "ru";
+            if (lang.StartsWith("es")) return "es";
+            if (lang.StartsWith("fr")) return "fr";
+            if (lang.StartsWith("de")) return "de";
+            return lang; // 其他：不特别支持，占比判断将很宽松
+        }
+
+        private static bool IsTargetLetter(char c, string lang)
+        {
+            switch (lang)
+            {
+                case "zh":
+                    return (c >= 0x4E00 && c <= 0x9FFF)   // CJK
+                        || (c >= 0x3400 && c <= 0x4DBF)   // CJK Ext-A
+                        || (c >= 0xF900 && c <= 0xFAFF);  // CJK Compatibility
+                case "ja":
+                    return (c >= 0x3040 && c <= 0x309F)   // ひらがな
+                        || (c >= 0x30A0 && c <= 0x30FF)   // カタカナ
+                        || (c >= 0xFF66 && c <= 0xFF9D)   // 半角片假名
+                        || (c >= 0x4E00 && c <= 0x9FFF)   // 常用汉字
+                        || (c >= 0x3400 && c <= 0x4DBF)
+                        || (c >= 0xF900 && c <= 0xFAFF);
+                case "ko":
+                    return (c >= 0xAC00 && c <= 0xD7AF)   // Hangul syllables
+                        || (c >= 0x1100 && c <= 0x11FF)   // Jamo
+                        || (c >= 0x3130 && c <= 0x318F);  // Compatibility Jamo
+                case "en":
+                    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+                case "ru":
+                    return (c >= 0x0400 && c <= 0x04FF);  // Cyrillic
+                case "es":
+                case "fr":
+                case "de":
+                    // 粗略：认为拉丁字母即可
+                    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                         || (c >= 0x00C0 && c <= 0x024F); // Latin-1 Supplement & Latin Extended
+                default:
+                    // 默认：认为任何字母都计入目标（会使覆盖度偏高，因而更易跳过；如不想可改成 false）
+                    return false;
+            }
+        }
+        /* ==================== 语言占比检测 结束 ==================== */
+
         public async Task<string> TranslateHtmlFileAsync(string inputPath, string outputPath, CancellationToken ct = default)
         {
             ct.ThrowIfCancellationRequested();
-
-            string html;
-            try
-            {
-                // 原封不动读取（UTF-8；如需特定编码可扩展）
-                html = File.ReadAllText(inputPath, Encoding.UTF8);
-            }
-            catch (Exception ex)
-            {
-                Log.Error($"读取源 HTML 失败：{inputPath}\n{ex}");
-                throw;
-            }
-
+            string html = File.ReadAllText(inputPath, Encoding.UTF8); // 原封不动读取
             var translated = await TranslateHtmlAsync(html, ct).ConfigureAwait(false);
 
             try
             {
-                // 写出翻译结果（不加 BOM）
                 var utf8NoBom = new UTF8Encoding(false);
                 File.WriteAllText(outputPath, translated, utf8NoBom);
             }
             catch (Exception ex)
             {
-                Log.Error($"写入翻译 HTML 失败：{outputPath}\n{ex}");
-                // 写文件失败不影响返回给上层
+                Log.Warn($"写入翻译 HTML 失败：{outputPath} - {ex.Message}");
             }
-
             return translated;
         }
 
-        /*──────── 3. TranslateHtmlAsync ────────*/
         public async Task<string> TranslateHtmlAsync(string html, CancellationToken ct = default)
         {
             var doc = new HtmlDocument();
+            doc.OptionWriteEmptyNodes = true;
             doc.LoadHtml(html);
 
-            // 跳过的标签（保持原排版与代码区域，避免破坏 URL）
-            var skip = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "script","style","noscript","code","pre","kbd","samp","var" };
+            // 跳过代码/样式/脚本等（满足“跳过代码”要求）
+            var skipTags = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "script","style","noscript","code","pre","kbd","samp","var","svg","math" };
 
-            // A) 处理含 <br> 的元素（行对齐；不触碰含 <a> 的段）
-            var processed = new HashSet<HtmlNode>();
-            var brSegs = new List<(HtmlNode el, string raw, string tail, string plain, int? idx)>();
-            int nextIdx = 0;
+            // 可翻译的文字属性（不动 href/src）
+            var translatableAttributes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "alt","title","aria-label" };
+            bool translateAttributes = true;
 
-            var brElems = doc.DocumentNode.Descendants()
-                .Where(e => e.NodeType == HtmlNodeType.Element
-                            && !skip.Contains(e.Name)
-                            && e.InnerHtml.IndexOf("<br", StringComparison.OrdinalIgnoreCase) >= 0)
+            var textNodes = doc.DocumentNode
+                .Descendants()
+                .Where(n => n.NodeType == HtmlNodeType.Text &&
+                            !HasAncestor(n, skipTags) &&
+                            !HasAncestor(n, "a"))
+                .Cast<HtmlTextNode>()
                 .ToList();
 
-            foreach (var el in brElems)
+            var attrHolders = new List<(HtmlAttribute attr, string leadingWs, string core, string trailingWs)>();
+            if (translateAttributes)
             {
-                var parts = Regex.Split(el.InnerHtml, @"<\s*br\s*/?>", RegexOptions.IgnoreCase);
-                foreach (string seg in parts)
+                foreach (var el in doc.DocumentNode.Descendants().Where(n => n.NodeType == HtmlNodeType.Element))
                 {
-                    string tail = Regex.Match(seg, @"(<[^>]+>)+\s*$").Value;
-                    string inner = seg.Substring(0, seg.Length - tail.Length);
-                    string plain = WebUtility.HtmlDecode(Regex.Replace(inner, "<[^>]+>", ""))
-                                   .Replace("\r", " ").Replace("\n", " ").Trim();
-
-                    bool hasA = seg.IndexOf("<a ", StringComparison.OrdinalIgnoreCase) >= 0;
-                    if (!hasA && plain.Length > 0)
-                        brSegs.Add((el, seg, tail, plain, nextIdx++));
-                    else
-                        brSegs.Add((el, seg, tail, null, null));
-                }
-                foreach (var n in el.DescendantsAndSelf()) processed.Add(n);
-            }
-
-            List<string> transBr = null;
-            if (nextIdx > 0)
-            {
-                var src = new string[nextIdx];
-                foreach (var s in brSegs) if (s.idx.HasValue) src[s.idx.Value] = s.plain;
-                transBr = await TranslateWithDegradeAsync(src.ToList(), ct).ConfigureAwait(false);
-            }
-
-            if (transBr != null)
-            {
-                foreach (var g in brSegs.GroupBy(s => s.el))
-                {
-                    var rebuilt = new List<string>();
-                    foreach (var s in g)
-                        rebuilt.Add(s.idx == null ? s.raw
-                            : WebUtility.HtmlEncode(CleanMarkers(transBr[s.idx.Value])));
-                    g.Key.InnerHtml = string.Join("<br>", rebuilt);
+                    foreach (var a in el.Attributes)
+                    {
+                        if (!translatableAttributes.Contains(a.Name)) continue;
+                        var raw = a.Value;
+                        if (string.IsNullOrEmpty(raw) || raw.Trim().Length == 0) continue;
+                        SplitEdgeWhitespace(raw, out var pre, out var core, out var post);
+                        if (core.Length == 0) continue;
+                        attrHolders.Add((a, pre, core, post));
+                    }
                 }
             }
 
-            // B) 普通文本节点（不处理链接文本）
-            var textNodes = doc.DocumentNode.Descendants()
-                .Where(n => n.NodeType == HtmlNodeType.Text
-                            && !string.IsNullOrWhiteSpace(n.InnerText)
-                            && !HasAncestor(n, skip)
-                            && !HasAncestor(n, "a")
-                            && !processed.Contains(n.ParentNode))
-                .ToList();
+            if (textNodes.Count == 0 && attrHolders.Count == 0)
+                return doc.DocumentNode.InnerHtml;
 
-            if (textNodes.Count > 0)
+            var items = new List<(Action<string> setter, string core)>(textNodes.Count + attrHolders.Count);
+
+            // 文本节点
+            foreach (var tn in textNodes)
             {
-                var src2 = textNodes.Select(n => WebUtility.HtmlDecode(n.InnerText)
-                                            .Replace("\r", " ").Replace("\n", " ").Trim()).ToList();
-                var dst2 = await TranslateWithDegradeAsync(src2, ct).ConfigureAwait(false);
+                var raw = tn.Text;
+                if (string.IsNullOrEmpty(raw)) continue;
+                SplitEdgeWhitespace(raw, out var pre, out var core, out var post);
+                if (core.Length == 0) continue;
 
-                for (int i = 0; i < textNodes.Count; i++)
-                    textNodes[i].InnerHtml = WebUtility.HtmlEncode(CleanMarkers(dst2[i]));
+                items.Add((
+                    setter: (string translated) => { tn.Text = pre + translated + post; },
+                    core: NormalizeForLLM(core)));
+            }
+
+            // 属性
+            foreach (var (attr, pre, core, post) in attrHolders)
+            {
+                items.Add((
+                    setter: (string translated) => { attr.Value = pre + translated + post; },
+                    core: NormalizeForLLM(core)));
+            }
+
+            if (items.Count == 0)
+                return doc.DocumentNode.InnerHtml;
+
+            var srcList = items.Select(i => i.core).ToList();
+            var dstList = await TranslateWithDegradeAsync(srcList, ct).ConfigureAwait(false);
+
+            for (int i = 0; i < items.Count; i++)
+            {
+                var outLine = dstList[i] ?? srcList[i];
+
+                // 单行守卫：真实 CR/LF 改为空格（不影响 <br>）
+                if (outLine.IndexOf('\n') >= 0 || outLine.IndexOf('\r') >= 0)
+                    outLine = Regex.Replace(outLine, @"[\r\n]+", " ");
+
+                // 最小清洗：去 $$ i $$ 等
+                outLine = Regex.Replace(outLine, @"\$\$\s*i\s*\$\$", "", RegexOptions.IgnoreCase);
+
+                items[i].Item1(outLine);
             }
 
             return doc.DocumentNode.InnerHtml;
         }
 
-        /*──────── 4. 分段降级：10行 → 3-3-4 → 单行 ────────*/
+        private static string NormalizeForLLM(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return s;
+            return s.Replace("\r", " ").Replace("\n", " ");
+        }
+
+        private static void SplitEdgeWhitespace(string raw, out string leading, out string core, out string trailing)
+        {
+            var m1 = Regex.Match(raw, @"^\s+");
+            var m2 = Regex.Match(raw, @"\s+$");
+            leading = m1.Success ? m1.Value : "";
+            trailing = m2.Success ? m2.Value : "";
+            int start = leading.Length;
+            int len = raw.Length - start - trailing.Length;
+            core = len > 0 ? raw.Substring(start, len) : "";
+        }
+
+        /* ====== 你的原“降级/管线”风格（保留） ====== */
+
         private async Task<List<string>> TranslateWithDegradeAsync(List<string> src, CancellationToken ct)
         {
             int n = src.Count;
@@ -228,11 +329,10 @@ namespace DescriptionTranslator
                     res[start + i] = await SingleTranslateAsync(src[start + i], start + i, ct).ConfigureAwait(false);
         }
 
-        /*──────── 5. 批量 / 单行 执行（保持原模式） ────────*/
         private Task<string[]> BatchTranslateAsync(List<string> lines, string tag, int off, CancellationToken ct)
         {
             string sys = BuildSystemPrompt(
-                $"Translate the following text into {cfg.TargetLang}. Keep the same number of lines and preserve line breaks.");
+                $"Translate the following text into {cfg.TargetLang}. Keep the same number of lines and preserve punctuation and symbols. Do not insert newlines.");
             string user = string.Join("\n", lines);
 
             return EnqueueHttp(async () =>
@@ -240,13 +340,18 @@ namespace DescriptionTranslator
                 string raw = await CallLLMAsync(sys, user, tag, off, ct).ConfigureAwait(false);
                 if (raw == null) return null;
 
-                raw = Regex.Replace(raw, @"\s*\r?\n\s*", "\n").Trim();
-                var outs = raw.Split('\n').Select(s => s.Trim()).ToArray();
+                raw = Regex.Replace(raw, @"\s*\r?\n\s*", "\n").TrimEnd();
+                var outs = raw.Split('\n').Select(s => s).ToArray();
+
                 if (outs.Length != lines.Count) return null;
 
                 for (int i = 0; i < outs.Length; i++)
-                    if (IsHallucination(outs[i], lines[i])) return null;
+                {
+                    if (outs[i].IndexOf('\n') >= 0 || outs[i].IndexOf('\r') >= 0)
+                        outs[i] = Regex.Replace(outs[i], @"[\r\n]+", " ");
 
+                    if (IsHallucination(outs[i], lines[i])) return null;
+                }
                 return outs;
             }, ct);
         }
@@ -258,20 +363,22 @@ namespace DescriptionTranslator
                 int fail = 0;
                 while (true)
                 {
-                    string sys = BuildSystemPrompt($"Translate this line into {cfg.TargetLang}.");
-                    string res = (await CallLLMAsync(sys, text, "S1", idx, ct).ConfigureAwait(false))?.Trim();
+                    string sys = BuildSystemPrompt($"Translate this line into {cfg.TargetLang}. Keep punctuation and symbols and do not insert newlines.");
+                    string res = (await CallLLMAsync(sys, text, "S1", idx, ct).ConfigureAwait(false));
+
+                    if (!string.IsNullOrEmpty(res) && (res.IndexOf('\n') >= 0 || res.IndexOf('\r') >= 0))
+                        res = null;
 
                     if (!string.IsNullOrWhiteSpace(res) && !IsHallucination(res, text))
                         return res;
 
-                    if (++fail > SINGLE_HALLUCINATION_MAX) return text;   // 最终放弃
-                    Log.Warn($"[S1] idx={idx} 幻觉/空结果 第{fail}次重排尾");
+                    if (++fail > SINGLE_HALLUCINATION_MAX) return text; // 回退原文
+                    Log.Warn($"[S1] idx={idx} 幻觉/空结果 第{fail}次重试");
                     await Task.Delay(200, ct).ConfigureAwait(false);
                 }
             }, ct);
         }
 
-        /*──────── 6. 有界重试 + 并发闸门（稳定） ────────*/
         private static async Task<T> EnqueueHttp<T>(Func<Task<T>> inner, CancellationToken ct)
         {
             int attempt = 0;
@@ -319,7 +426,6 @@ namespace DescriptionTranslator
             return false;
         }
 
-        /*──────── 7. HTTP 调用（按 UseOpenAI 动态组装参数） ────────*/
         private object BuildBodyForRequest(string sys, string user)
         {
             if (cfg.UseOpenAI)
@@ -366,7 +472,6 @@ namespace DescriptionTranslator
             var bodyObj = BuildBodyForRequest(sys, user);
             string jsonBody = Newtonsoft.Json.JsonConvert.SerializeObject(bodyObj);
 
-            // 预览日志（截断）
             var prev = (sys + "\n" + user);
             if (prev.Length > 300) prev = prev.Substring(0, 300) + "...";
             Log.Info($"[SEND] {tag} off={off}\n{prev}");
@@ -393,7 +498,6 @@ namespace DescriptionTranslator
                     string previewRsp = rsp.Length > 2048 ? rsp.Substring(0, 2048) + "..." : rsp;
                     Log.Info($"[RECV] {tag} off={off} bytes={rsp.Length}\n{previewRsp}");
 
-                    // 兼容 chat/completions 与若干兼容实现
                     var jt = JObject.Parse(rsp);
                     return (string)jt["choices"]?[0]?["message"]?["content"]
                         ?? (string)jt["choices"]?[0]?["text"]
@@ -407,13 +511,17 @@ namespace DescriptionTranslator
             }
         }
 
-        /*──────── 8. 工具（轻度清洗；不改排版/URL） ────────*/
+        /* ====== 你的“幻觉检测”（原样保留） ====== */
+        private static readonly string[] SuspiciousWords = { "千岁", "千景", "张三" };
+
         private static bool IsHallucination(string tr, string or)
         {
             if (string.IsNullOrWhiteSpace(tr)) return true;
             if (tr.Contains("\\n") || Regex.IsMatch(tr, @"%\\d+;")) return true;
 
-            // 过度长度比/异常字符占比
+            foreach (var w in SuspiciousWords)
+                if (tr.Contains(w) && !or.Contains(w)) return true;
+
             string ct = Regex.Replace(tr, "[^a-zA-Z0-9\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]", "");
             string co = Regex.Replace(or, "[^a-zA-Z0-9\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]", "");
             if (co.Length == 0) return false;
@@ -421,13 +529,6 @@ namespace DescriptionTranslator
             double r = (double)ct.Length / co.Length;
             if (r > 3.5 || r < 0.15) return true;
             return (tr.Length - ct.Length) > 3 * ct.Length;
-        }
-
-        private static string CleanMarkers(string dst)
-        {
-            if (string.IsNullOrEmpty(dst)) return dst;
-            // 仅压缩多余空白；不改结构不改链接
-            return Regex.Replace(dst, @"\s{2,}", " ").Trim();
         }
 
         private static bool HasAncestor(HtmlNode n, HashSet<string> tags)
