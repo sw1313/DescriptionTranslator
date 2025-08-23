@@ -60,6 +60,7 @@ namespace DescriptionTranslator
 
         /// <summary>
         /// TEMP HTML 中转 + 不确定进度 + 分批写库（NAS/SMB 友好）
+        /// （改动点：译文仅写入 TEMP，全部完成后再统一从 TEMP 读取写库）
         /// </summary>
         private void TranslateGames(IEnumerable<Game> games)
         {
@@ -89,7 +90,8 @@ namespace DescriptionTranslator
                 int parallelGames = Math.Max(1, cfg.ChunkConcurrency);
                 var gate = new SemaphoreSlim(parallelGames, parallelGames);
 
-                var results = new ConcurrentDictionary<Guid, string>();
+                // 改动：存“译文临时文件路径”，不再存译文内容
+                var resultPaths = new ConcurrentDictionary<Guid, string>();
                 var utf8NoBom = new UTF8Encoding(false);
 
                 var tasks = gameList.Select(async g =>
@@ -99,7 +101,7 @@ namespace DescriptionTranslator
                     {
                         if (progress.CancelToken.IsCancellationRequested) return;
 
-                        // === 新增：整页目标语言占比检测（仅看可翻译纯文本；跳过代码/链接）===
+                        // === 整页目标语言占比检测（仅看可翻译纯文本；跳过代码/链接）===
                         try
                         {
                             if (translator.ShouldSkipByLanguage(g.Description, out double cov))
@@ -130,11 +132,27 @@ namespace DescriptionTranslator
                             return;
                         }
 
-                        // 2) 翻译（内部：只改文本，不动标签/URL）
-                        string newHtml = await translator.TranslateHtmlFileAsync(srcPath, dstPath, progress.CancelToken)
-                                                         .ConfigureAwait(false);
+                        // 2) 翻译（内部：只改文本，不动标签/URL）→ 写入 dstPath
+                        _ = await translator.TranslateHtmlFileAsync(srcPath, dstPath, progress.CancelToken)
+                                             .ConfigureAwait(false);
 
-                        results[g.Id] = newHtml;
+                        // 3) 仅登记“存在且非空”的译文文件路径
+                        try
+                        {
+                            var fi = new FileInfo(dstPath);
+                            if (fi.Exists && fi.Length > 0)
+                            {
+                                resultPaths[g.Id] = dstPath;
+                            }
+                            else
+                            {
+                                Log.Warn($"[{g.Name}] 译文临时文件缺失或为空，跳过写库。");
+                            }
+                        }
+                        catch (Exception exCheck)
+                        {
+                            Log.Warn($"[{g.Name}] 检查译文临时文件失败：{exCheck.Message}");
+                        }
                     }
                     catch (OperationCanceledException) { }
                     catch (Exception ex)
@@ -151,11 +169,12 @@ namespace DescriptionTranslator
 
                 await Task.WhenAll(tasks).ConfigureAwait(false);
 
+                // —— 统一写库：此时每个游戏的译文都已经完整落到 TEMP —— 
                 progress.Text = "正在写入结果…";
                 const int WRITE_CHUNK = 10; // SMB/NAS 可调 5~10
                 var toWrite = gameList
-                    .Where(g => results.ContainsKey(g.Id))
-                    .Select(g => (Game: g, Html: results[g.Id]))
+                    .Where(g => resultPaths.ContainsKey(g.Id))
+                    .Select(g => (Game: g, Path: resultPaths[g.Id]))
                     .ToList();
 
                 int wrote = 0;
@@ -169,10 +188,26 @@ namespace DescriptionTranslator
                     {
                         using (api.Database.BufferedUpdate())
                         {
-                            foreach (var (game, html) in slice)
+                            foreach (var (game, path) in slice)
                             {
-                                game.Description = html;
-                                api.Database.Games.Update(game);
+                                try
+                                {
+                                    // 从 TEMP 文件一次性读入，再写入数据库
+                                    string html = File.ReadAllText(path, Encoding.UTF8);
+                                    if (!string.IsNullOrEmpty(html))
+                                    {
+                                        game.Description = html;
+                                        api.Database.Games.Update(game);
+                                    }
+                                    else
+                                    {
+                                        Log.Warn($"[{game.Name}] 译文临时文件为空，跳过写库：{path}");
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    Log.Error($"[{game.Name}] 从临时文件读取译文失败：{ex.Message}");
+                                }
                             }
                         }
                     });
